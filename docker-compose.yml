@@ -1,0 +1,171 @@
+services:
+  cpp-builder:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: ./Dockerfile.builder
+    volumes:
+      - ./build:/build/output
+
+  cleanup-service:
+    image: alpine:latest
+    volumes:
+      - ./orders:/app/bin/orders
+    command: >
+      sh -c "while true; do
+             find /app/bin/orders -type f -mtime +7 -name 'orders_*.json' -delete;
+             echo 'Cleaned up order files older than 7 days';
+             sleep 604800;
+             done"
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - order_network
+
+  order-service:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./build:/app/build
+      - ./orders:/app/bin/orders
+    depends_on:
+      cpp-builder:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LD_LIBRARY_PATH=/app/build/lib
+      - USERNAME_TEST=${USERNAME_TEST}
+      - PASSWORD_TEST=${PASSWORD_TEST}
+      - RITHMIC_ENV=${RITHMIC_ENV}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_HOST=${POSTGRES_HOST}
+      - POSTGRES_PORT=${POSTGRES_PORT}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - order_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    env_file:
+      - .env
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./nginx/certs:/etc/nginx/certs
+      - certbot-etc:/etc/letsencrypt
+      - certbot-var:/var/lib/letsencrypt
+      - webroot:/var/www/html
+      - ./nginx/init-certs.sh:/docker-entrypoint.d/init-certs.sh
+    depends_on:
+      - order-service
+    restart: unless-stopped
+    networks:
+      - order_network
+    environment:
+      - DOMAIN=${DOMAIN}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - NGINX_ENVSUBST_TEMPLATE_DIR=/etc/nginx/templates
+      - NGINX_ENVSUBST_TEMPLATE_SUFFIX=.template
+      - NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx/conf.d
+    command: "/bin/sh -c 'while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g \"daemon off;\"'"
+
+  certbot:
+    image: certbot/certbot
+    container_name: certbot
+    volumes:
+      - certbot-etc:/etc/letsencrypt
+      - certbot-var:/var/lib/letsencrypt
+      - webroot:/var/www/html
+      - ./nginx/certs:/nginx/certs
+    depends_on:
+      - nginx
+    entrypoint: sh -c "
+      mkdir -p /nginx/certs &&
+      certbot certonly --webroot \
+        --webroot-path=/var/www/html \
+        --email ${CERTBOT_EMAIL} \
+        --agree-tos \
+        --no-eff-email \
+        --staging \
+        -d ${DOMAIN} &&
+      cp -rL /etc/letsencrypt/live/${DOMAIN}/* /nginx/certs/ &&
+      chmod -R 755 /nginx/certs"
+    environment:
+      - CERTBOT_EMAIL=${CERTBOT_EMAIL}
+      - DOMAIN=${DOMAIN}
+    profiles:
+      - production
+
+  certbot-renewal:
+    image: certbot/certbot
+    volumes:
+      - certbot-etc:/etc/letsencrypt
+      - certbot-var:/var/lib/letsencrypt
+      - webroot:/var/www/html
+      - ./nginx/certs:/nginx/certs
+    entrypoint: sh -c "
+      trap exit TERM; 
+      while :; do 
+        certbot renew \
+          --webroot \
+          --webroot-path=/var/www/html \
+          --deploy-hook 'cp -rL /etc/letsencrypt/live/${DOMAIN}/* /nginx/certs/ && chmod -R 755 /nginx/certs'; 
+        sleep 12h & wait $${!}; 
+      done"
+    environment:
+      - CERTBOT_EMAIL=${CERTBOT_EMAIL}
+      - DOMAIN=${DOMAIN}
+    profiles:
+      - production
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - order_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  certbot-etc:
+  certbot-var:
+  webroot:
+  redis_data:
+
+networks:
+  order_network:
+    driver: bridge
