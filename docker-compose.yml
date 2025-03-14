@@ -1,12 +1,4 @@
 services:
-  cpp-builder:
-    platform: linux/amd64
-    build:
-      context: .
-      dockerfile: ./Dockerfile.builder
-    volumes:
-      - ./build:/build/output
-
   cleanup-service:
     image: alpine:latest
     volumes:
@@ -37,8 +29,6 @@ services:
       - ./build:/app/build
       - ./orders:/app/bin/orders
     depends_on:
-      cpp-builder:
-        condition: service_completed_successfully
       redis:
         condition: service_started
     environment:

@@ -1,136 +1,111 @@
 import logging
 import asyncio
+import json
+import os
 from typing import List
 from app.models.trade import Credentials, AccountData
-import os
-import json
+import rapi
 
 logger = logging.getLogger(__name__)
 
 
-async def execute_account_fetcher(credentials: Credentials) -> List[AccountData]:
-    """Execute the GetAccountList executable"""
+def load_connection_params(server_type: str, location: str):
+    """Load Rithmic connection parameters from configuration file"""
     try:
-        # Define possible executable paths in order of preference
-        executable_paths = [
-            os.path.join(os.environ.get("PATH", "").split(":")[0], "GetAccountList"),
-            "/app/bin/GetAccountList",
-            "/app/GetAccountList",
-            "./GetAccountList",
-        ]
+        with open("server_configurations.json", "r") as f:
+            config = json.load(f)
 
-        # Log environment for debugging
-        logger.info(f"Current working directory: {os.getcwd()}")
-        logger.info(f"PATH environment: {os.environ.get('PATH', 'not set')}")
-        logger.info(
-            f"LD_LIBRARY_PATH environment: {os.environ.get('LD_LIBRARY_PATH', 'not set')}"
+            # Verify required sections exist
+            if server_type not in config:
+                raise ValueError(f"Missing '{server_type}' section in configuration")
+            if "server_configs" not in config[server_type]:
+                raise ValueError(
+                    f"Missing 'server_configs' section in {server_type} configuration"
+                )
+            if location not in config[server_type]["server_configs"]:
+                raise ValueError(f"Missing '{location}' configuration in {server_type}")
+
+            # Log the configuration being used
+            logger.info(f"Using {server_type}/{location} configuration")
+            return json.dumps(config)
+    except Exception as e:
+        logger.error(f"Failed to load server configurations: {e}")
+        raise RuntimeError(f"Failed to load server configurations: {e}")
+
+
+async def execute_account_fetcher(credentials: Credentials) -> List[AccountData]:
+    """Execute the account fetcher using the RApi package"""
+    try:
+        # Load connection parameters with server type and location
+        connection_params = load_connection_params(
+            credentials.server_type, credentials.location
         )
-        logger.info("Checking executable paths:")
+        logger.info("Successfully loaded connection parameters")
 
-        executable_path = None
-        for path in executable_paths:
-            logger.info(f"Checking path: {path}")
-            if os.path.exists(path):
-                try:
-                    # Check if file is executable
-                    if os.access(path, os.X_OK):
-                        executable_path = path
-                        logger.info(f"Found executable at: {path}")
-                        break
-                    else:
-                        logger.warning(f"File exists but is not executable: {path}")
-                except Exception as e:
-                    logger.warning(f"Error checking path {path}: {e}")
-            else:
-                logger.info(f"Path does not exist: {path}")
-
-        if not executable_path:
-            raise FileNotFoundError(
-                f"Failed to find GetAccountList executable. Searched in: {', '.join(executable_paths)}"
-            )
-
-        # Get the directory containing the executable
-        exec_dir = os.path.dirname(executable_path)
-
-        command = [
-            executable_path,
-            credentials.username,
-            credentials.password,
+        # Create REngine with connection parameters
+        engine = rapi.REngine(
+            "DeltalytixRithmicAPI",
+            "1.0.0.0",
+            connection_params,
             credentials.server_type,
             credentials.location,
-        ]
+        )
+        logger.info("Successfully created REngine instance")
 
-        # Log command (with password masked)
-        safe_command = command.copy()
-        safe_command[2] = "********"
-        logger.info(f"Executing command: {' '.join(safe_command)}")
+        # Set up callbacks
+        accounts = []
 
-        # Set up environment
-        env = os.environ.copy()
-        lib_path = os.path.join(exec_dir, "lib")
-        if "LD_LIBRARY_PATH" in env:
-            env["LD_LIBRARY_PATH"] = f"{lib_path}:{env['LD_LIBRARY_PATH']}"
+        def on_account_list(account_list):
+            """Callback for when account list is received"""
+            logger.info(f"Received account list with {len(account_list)} accounts")
+            for acc in account_list:
+                accounts.append(
+                    AccountData(
+                        account_id=acc.account_id, fcm_id=acc.fcm_id, ib_id=acc.ib_id
+                    )
+                )
+
+        def on_alert(alert_type, message):
+            """Callback for alerts"""
+            logger.info(f"Alert {alert_type}: {message}")
+
+        # Set up callbacks
+        engine.set_callbacks(
+            on_account_list,  # First callback
+            None,  # on_order_replay
+            None,  # on_order_history_dates
+            None,  # on_product_rms_list
+            on_alert,  # Last callback
+        )
+        logger.info("Successfully set up callbacks")
+
+        # Login to the system
+        if not engine.login(credentials.username, credentials.password):
+            error_code = engine.get_error_code()  # Get the error code first
+            error_message = rapi.REngine.get_error_string(
+                error_code
+            )  # Pass the error code
+            raise RuntimeError(f"Failed to login: {error_message}")
+        logger.info("Successfully logged in")
+
+        # Request account list immediately after successful login
+        if not engine.get_accounts():
+            error_code = engine.get_error_code()
+            error_message = rapi.REngine.get_error_string(error_code)
+            raise RuntimeError(f"Failed to get accounts: {error_message}")
+        logger.info("Successfully requested account list")
+
+        # Wait for account list to be received (this is now handled by the C++ layer)
+        # No need for sleep here as the C++ layer handles the waiting
+
+        # Logout
+        if not engine.logout():
+            logger.warning("Failed to logout cleanly")
         else:
-            env["LD_LIBRARY_PATH"] = lib_path
+            logger.info("Successfully logged out")
 
-        logger.info(f"Using LD_LIBRARY_PATH: {env['LD_LIBRARY_PATH']}")
-
-        # Change to executable directory to ensure it can find its dependencies
-        original_dir = os.getcwd()
-        os.chdir(exec_dir)
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-
-            accounts = []
-            error_message = None
-
-            stdout, stderr = await process.communicate()
-
-            # Log both stdout and stderr for debugging
-            if stdout:
-                logger.debug(f"stdout: {stdout.decode()}")
-            if stderr:
-                logger.warning(f"stderr: {stderr.decode()}")
-
-            # Process output
-            for line in stdout.decode().split("\n"):
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line.strip())
-                    if data.get("type") == "accounts":
-                        accounts.extend(
-                            [
-                                AccountData(**account)
-                                for account in data.get("accounts", [])
-                            ]
-                        )
-                    elif data.get("type") == "log" and data.get("level") == "error":
-                        error_message = data.get("message")
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse JSON line: {line}, Error: {e}")
-                    continue
-
-            if process.returncode != 0 or error_message:
-                error_details = f"Exit code: {process.returncode}"
-                if error_message:
-                    error_details += f", Message: {error_message}"
-                if stderr:
-                    error_details += f", stderr: {stderr.decode()}"
-                raise RuntimeError(f"Failed to retrieve accounts. {error_details}")
-
-            logger.info(f"Successfully retrieved {len(accounts)} accounts")
-            return accounts
-
-        finally:
-            # Change back to original directory
-            os.chdir(original_dir)
+        logger.info(f"Successfully retrieved {len(accounts)} accounts")
+        return accounts
 
     except Exception as e:
         logger.error(f"Error executing account fetcher: {e}")

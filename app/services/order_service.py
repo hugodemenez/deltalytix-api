@@ -8,6 +8,7 @@ from fastapi import BackgroundTasks
 from app.models.trade import OrderRequest
 from app.services.websocket_service import ws_manager
 from app.services.trade_service import process_orders, store_trades
+from app.services.rithmic_orders_retrieval import retrieve_rithmic_orders
 from datetime import datetime
 import shutil
 
@@ -18,169 +19,19 @@ processing_tasks: Dict[str, dict] = {}
 
 
 async def execute_order_fetcher(request: OrderRequest, session_id: str = None) -> Dict:
-    """Execute the OrderFetcher executable"""
+    """Execute the Rithmic orders retrieval service"""
     try:
-        # Define possible executable paths in order of preference
-        executable_paths = [
-            os.path.join(os.environ.get("PATH", "").split(":")[0], "OrderFetcher"),
-            "/app/bin/OrderFetcher",
-            "/app/OrderFetcher",
-            "./OrderFetcher",
-        ]
+        # Use Rithmic orders retrieval service
+        orders_data = await retrieve_rithmic_orders(request, session_id)
 
-        # Log environment for debugging
-        logger.info(f"Current working directory: {os.getcwd()}")
-        logger.info(f"PATH environment: {os.environ.get('PATH', 'not set')}")
-        logger.info(
-            f"LD_LIBRARY_PATH environment: {os.environ.get('LD_LIBRARY_PATH', 'not set')}"
+        if not orders_data:
+            raise RuntimeError("No orders data returned")
+
+        num_accounts = len(
+            [k for k in orders_data.keys() if k not in ["status", "timestamp"]]
         )
-        logger.info("Checking executable paths:")
-
-        executable_path = None
-        for path in executable_paths:
-            logger.info(f"Checking path: {path}")
-            if os.path.exists(path):
-                try:
-                    # Check if file is executable
-                    if os.access(path, os.X_OK):
-                        executable_path = path
-                        logger.info(f"Found executable at: {path}")
-                        break
-                    else:
-                        logger.warning(f"File exists but is not executable: {path}")
-                except Exception as e:
-                    logger.warning(f"Error checking path {path}: {e}")
-            else:
-                logger.info(f"Path does not exist: {path}")
-
-        if not executable_path:
-            raise FileNotFoundError(
-                f"Failed to find OrderFetcher executable. Searched in: {', '.join(executable_paths)}"
-            )
-
-        # Get the directory containing the executable
-        exec_dir = os.path.dirname(executable_path)
-
-        # Validate date format
-        try:
-            datetime.strptime(request.start_date, "%Y%m%d")
-        except ValueError:
-            raise ValueError("Invalid date format. Please use YYYYMMDD format.")
-
-        # Build command
-        command = [
-            executable_path,
-            request.username,
-            request.password,
-            request.server_type,  # Use server_type (e.g., "SpeedUp")
-            request.server_name,  # Use server_name as location (e.g., "Chicago Area")
-            request.start_date,
-        ]
-
-        if request.account_ids:
-            command.extend(request.account_ids)
-
-        # Set up environment
-        env = os.environ.copy()
-        lib_path = os.path.join(exec_dir, "lib")
-        if "LD_LIBRARY_PATH" in env:
-            env["LD_LIBRARY_PATH"] = f"{lib_path}:{env['LD_LIBRARY_PATH']}"
-        else:
-            env["LD_LIBRARY_PATH"] = lib_path
-
-        # Log command (with password masked)
-        safe_command = command.copy()
-        safe_command[2] = "********"
-        logger.info(f"Executing command: {' '.join(safe_command)}")
-        logger.info(
-            f"Using server type: {request.server_type} with location: {request.server_name}"
-        )
-        logger.info(f"Using LD_LIBRARY_PATH: {env['LD_LIBRARY_PATH']}")
-
-        # Change to executable directory to ensure it can find its dependencies
-        original_dir = os.getcwd()
-        os.chdir(exec_dir)
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-
-            orders_data = {}
-            error_message = None
-            orders_file = None
-
-            # Create tasks to read stdout and stderr streams
-            async def read_stream(stream, is_stderr=False):
-                while True:
-                    line = await stream.readline()
-                    if not line:
-                        break
-
-                    decoded_line = line.decode().strip()
-                    if not decoded_line:
-                        continue
-
-                    try:
-                        data = json.loads(decoded_line)
-                        # Forward all messages to the client if we have a session_id
-                        if session_id:
-                            await ws_manager.broadcast_to_session(session_id, data)
-
-                        if data.get("type") == "complete" and "orders_file" in data:
-                            # Get the orders file path
-                            nonlocal orders_file
-                            orders_file = os.path.join(exec_dir, data["orders_file"])
-                            logger.info(f"Orders file written to: {orders_file}")
-
-                            # Read orders from the file
-                            if os.path.exists(orders_file):
-                                with open(orders_file, "r") as f:
-                                    orders_data.update(json.load(f))
-                                logger.info(
-                                    f"Successfully loaded orders from {orders_file}"
-                                )
-                        elif data.get("type") == "log" and data.get("level") == "error":
-                            error_message = data.get("message")
-                    except json.JSONDecodeError:
-                        # For non-JSON output, send as log message
-                        if session_id:
-                            log_message = {
-                                "type": "log",
-                                "level": "error" if is_stderr else "info",
-                                "message": decoded_line,
-                                "timestamp": int(datetime.now().timestamp()),
-                            }
-                            await ws_manager.broadcast_to_session(
-                                session_id, log_message
-                            )
-
-            # Wait for both streams to complete
-            await asyncio.gather(
-                read_stream(process.stdout, False), read_stream(process.stderr, True)
-            )
-
-            # Wait for process to complete
-            await process.wait()
-
-            if process.returncode != 0 or error_message:
-                error_details = f"Exit code: {process.returncode}"
-                if error_message:
-                    error_details += f", Message: {error_message}"
-                raise RuntimeError(f"Failed to retrieve orders. {error_details}")
-
-            num_accounts = len(
-                [k for k in orders_data.keys() if k not in ["status", "timestamp"]]
-            )
-            logger.info(f"Successfully retrieved orders for {num_accounts} accounts")
-            return orders_data
-
-        finally:
-            # Change back to original directory
-            os.chdir(original_dir)
+        logger.info(f"Successfully retrieved orders for {num_accounts} accounts")
+        return orders_data
 
     except Exception as e:
         logger.error(f"Error executing order fetcher: {e}")
@@ -219,8 +70,8 @@ async def process_websocket_data(
             f"Starting order processing for {len(selected_accounts)} accounts",
         )
 
-        # Execute order fetcher with session_id for real-time logging
-        orders_data = await execute_order_fetcher(request, session_id)
+        # Use Rithmic orders retrieval service instead of executable
+        orders_data = await retrieve_rithmic_orders(request, session_id)
 
         # Process orders and broadcast results
         await ws_manager.broadcast_to_session(
@@ -317,8 +168,8 @@ async def process_orders_background(process_id: str, request: OrderRequest):
         processing_tasks[process_id]["status"] = "running"
         processing_tasks[process_id]["started_at"] = datetime.now()
 
-        # Execute order fetcher
-        orders_data = await execute_order_fetcher(request)
+        # Use Rithmic orders retrieval service instead of executable
+        orders_data = await retrieve_rithmic_orders(request)
 
         if not orders_data:
             logger.warning(f"No orders data returned for process {process_id}")
