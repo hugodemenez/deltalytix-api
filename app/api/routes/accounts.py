@@ -33,7 +33,17 @@ async def get_accounts(credentials: Credentials):
             )
 
         # Execute account list fetcher
-        accounts = await execute_account_fetcher(credentials)
+        success, message, accounts = await execute_account_fetcher(credentials)
+
+        # If not successful, return error response
+        if not success:
+            return AccountListResponse(
+                success=False,
+                message=message,
+                accounts=[],
+                websocket_url="",
+                token="",
+            )
 
         # Create session
         session_id = str(uuid.uuid4())
@@ -46,13 +56,23 @@ async def get_accounts(credentials: Credentials):
 
         return AccountListResponse(
             success=True,
-            message=f"Successfully retrieved {len(accounts)} accounts",
+            message=message,
             accounts=accounts,
             websocket_url=f"ws://your-domain/ws/{session_id}",
             token=token,
         )
 
+    except HTTPException as e:
+        # Re-raise HTTP exceptions as they already have proper formatting
+        raise
     except Exception as e:
         logger.error(f"Error retrieving accounts: {e}")
         logger.exception(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        # Return a properly formatted error response
+        return AccountListResponse(
+            success=False,
+            message=str(e),
+            accounts=[],
+            websocket_url="",
+            token="",
+        )

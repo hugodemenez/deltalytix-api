@@ -33,7 +33,7 @@ router.include_router(orders.router, prefix="/orders", tags=["orders"])
 
 router.include_router(servers.router, prefix="/servers", tags=["servers"])
 
-router.include_router(websocket.router, prefix="/ws", tags=["websocket"])
+# router.include_router(websocket.router, prefix="/ws", tags=["websocket"])
 
 router.include_router(
     manual_orders.router, prefix="/manual-orders", tags=["manual-orders"]

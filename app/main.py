@@ -1,13 +1,15 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 import os
 from starlette.websockets import WebSocketDisconnect
 from websockets.exceptions import WebSocketException
+import uuid
 
 from app.core.config import settings, verify_environment
 from app.utils.logging import setup_logging
 from app.api.endpoints import router as api_router
+from app.websocket import websocket_manager
 
 # Set up logging
 setup_logging(
@@ -54,6 +56,30 @@ def create_application() -> FastAPI:
     async def health_check():
         """Health check endpoint"""
         return {"status": "healthy"}
+
+    @app.websocket("/ws/{client_id}")
+    async def websocket_endpoint(websocket: WebSocket, client_id: str):
+        await websocket_manager.connect(websocket, client_id)
+        try:
+            while True:
+                # Receive message from client
+                data = await websocket.receive_json()
+
+                # Handle different message types
+                if data.get("type") == "credentials":
+                    # Handle credentials and start account retrieval
+                    await websocket_manager.handle_credentials(
+                        client_id, data.get("credentials", {})
+                    )
+                elif data.get("type") == "get_orders":
+                    # Handle order retrieval request
+                    await websocket_manager.handle_order_request(client_id, data)
+
+        except WebSocketDisconnect:
+            websocket_manager.disconnect(client_id)
+        except Exception as e:
+            logger.error(f"WebSocket error: {str(e)}")
+            websocket_manager.disconnect(client_id)
 
     return app
 

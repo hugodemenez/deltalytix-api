@@ -166,4 +166,4 @@ ENV PATH="/app/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/app/bin/lib:${LD_LIBRARY_PATH}"
 
 # Run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--log-level", "debug", "--access-log", "--ws", "websockets", "--ws-max-size", "16777216", "--ws-max-queue", "32", "--ws-ping-interval", "20", "--ws-ping-timeout", "20", "--limit-concurrency", "1000", "--backlog", "2048"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--log-level", "debug", "--access-log", "--log-config", "app/logging_config.json", "--ws", "websockets", "--ws-max-size", "16777216", "--ws-max-queue", "32", "--ws-ping-interval", "20", "--ws-ping-timeout", "20", "--limit-concurrency", "1000", "--backlog", "2048"]
